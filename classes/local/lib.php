@@ -89,4 +89,78 @@ class lib {
         }
         return $running;
     }
+
+    /**
+     * Split the provided config file into chunks, and run each in a separate thread.
+     *
+     * @param string $config The config file path, relative to $CFG->dirroot.
+     */
+    public static function run(string $config = 'phpunit.xml'): void {
+        global $CFG;
+        if (!is_numeric($CFG->phpunit_paraunit_processes) || $CFG->phpunit_paraunit_processes < 2) {
+            throw new \Exception('Invalid phpunit_paraunit_processes setting: ' . $CFG->phpunit_paraunit_processes);
+        }
+
+        $originalpath = $CFG->dirroot . '/' . $config;
+        if (!file_exists($originalpath)) {
+            throw new \Exception('Config file not found at ' . $originalpath);
+        }
+
+        $phpunitxml = file_get_contents($originalpath);
+        $xmlhead = substr(
+            $phpunitxml,
+            0,
+            strpos($phpunitxml, '<testsuites>') + 12,
+        );
+        $xmlfoot = substr(
+            $phpunitxml,
+            strpos($phpunitxml, '</testsuites>'),
+        );
+        $xml = new \SimpleXMLElement($phpunitxml);
+        $currentthread = 0;
+        $testsuites = array_fill(0, $CFG->phpunit_paraunit_processes, []);
+        foreach ($xml->testsuites->testsuite as $testsuite) {
+            $testsuites[$currentthread][] = $testsuite;
+            $currentthread++;
+            if ($currentthread >= $CFG->phpunit_paraunit_processes) {
+                $currentthread = 0;
+            }
+        }
+
+        $procs = [];
+        $configroot = dirname($originalpath);
+        @mkdir($configroot);
+        for ($i = 0; $i < $CFG->phpunit_paraunit_processes; $i++) {
+            $configpath = $configroot . '/phpunit.' . $i . '.xml';
+            $configfile = fopen($configpath, 'w');
+            fwrite($configfile, $xmlhead);
+            foreach ($testsuites[$i] as $testsuite) {
+                fwrite($configfile, $testsuite->asXml() . PHP_EOL);
+            }
+            fwrite($configfile, $xmlfoot);
+            fclose($configfile);
+            $pathtophpunit = $CFG->dirroot . '/vendor/bin/phpunit';
+            $procs[] = proc_open("export TEST_TOKEN={$i} && {$pathtophpunit} -c {$configpath}", [STDIN, STDOUT, STDOUT], $unused);
+        }
+
+        echo $CFG->phpunit_paraunit_processes . " Threads started\n";
+
+        $lastvalue = $CFG->phpunit_paraunit_processes;
+        while (true) {
+            $newvalue = self::checkallprocs($procs);
+
+            if ($lastvalue === null || $newvalue < $lastvalue) {
+                echo $newvalue . " Threads pending\n";
+                $lastvalue = $newvalue;
+            }
+
+            if ($newvalue == 0) {
+                break;
+            }
+            sleep(1);
+        }
+        for ($i = 0; $i < $CFG->phpunit_paraunit_processes; $i++) {
+            unlink($configroot . '/phpunit.' . $i . '.xml');
+        }
+    }
 }
