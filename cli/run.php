@@ -37,6 +37,9 @@ You must run admin/tool/paratest/cli/init.php first.
 options:
 --config    -c  The phpunit configuration file to run, relative to `\$CFG->dirroot` (default: phpunit.xml).
 --help      -h  Display this message and exit.
+--junit     -j  Path to write the junit.xml test results file. The output of each thread will be combined together into a single
+                file for reporting. If the file already exists, the timing data will be used to help distribute testsuites evenly
+                between threads.
 EOF;
 
 
@@ -44,10 +47,12 @@ EOF;
     [
         'config' => 'phpunit.xml',
         'help' => false,
+        'junit' => null,
     ],
     [
         'c' => 'config',
         'h' => 'help',
+        'j' => 'junit',
     ],
 );
 
@@ -56,4 +61,4 @@ if ($options['help']) {
     exit(0);
 }
 
-\tool_paratest\local\lib::run($options['config']);
+\tool_paratest\local\lib::run($options['config'], $options['junit']);

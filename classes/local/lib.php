@@ -72,7 +72,8 @@ class lib {
 
             if ($newvalue == 0) {
                 break;
-            }
+	    }
+	    sleep(1);
         }
 
         echo "All threads completed\n";
@@ -95,7 +96,7 @@ class lib {
      *
      * @param string $config The config file path, relative to $CFG->dirroot.
      */
-    public static function run(string $config = 'phpunit.xml'): void {
+    public static function run(string $config = 'phpunit.xml', ?string $junit = null): void {
         global $CFG;
         if (!is_numeric($CFG->phpunit_paraunit_processes) || $CFG->phpunit_paraunit_processes < 2) {
             throw new \Exception('Invalid phpunit_paraunit_processes setting: ' . $CFG->phpunit_paraunit_processes);
@@ -117,14 +118,11 @@ class lib {
             strpos($phpunitxml, '</testsuites>'),
         );
         $xml = new \SimpleXMLElement($phpunitxml);
-        $currentthread = 0;
-        $testsuites = array_fill(0, $CFG->phpunit_paraunit_processes, []);
-        foreach ($xml->testsuites->testsuite as $testsuite) {
-            $testsuites[$currentthread][] = $testsuite;
-            $currentthread++;
-            if ($currentthread >= $CFG->phpunit_paraunit_processes) {
-                $currentthread = 0;
-            }
+        if ($junit) {
+            $junitxml = new \SimpleXMLElement(file_get_contents($junit));
+            $testsuites = self::distribute_testsuites_weighted($xml, $junitxml);
+        } else {
+            $testsuites = self::distribute_testsuites_round_robin($xml);
         }
 
         $procs = [];
@@ -139,8 +137,17 @@ class lib {
             }
             fwrite($configfile, $xmlfoot);
             fclose($configfile);
-            $pathtophpunit = $CFG->dirroot . '/vendor/bin/phpunit';
-            $procs[] = proc_open("export TEST_TOKEN={$i} && {$pathtophpunit} -c {$configpath}", [STDIN, STDOUT, STDOUT], $unused);
+            $pathtophpunit = escapeshellarg($CFG->dirroot . '/vendor/bin/phpunit');
+            $configpath = escapeshellarg($configpath);
+            $junitarg = '';
+            if ($junit) {
+                $junitarg = " --log-junit " . escapeshellarg("{$junit}.{$i}");
+            }
+            $procs[] = proc_open(
+                "export TEST_TOKEN={$i} && {$pathtophpunit} -c {$configpath}{$junitarg}",
+                [STDIN, STDOUT, STDOUT],
+                $unused
+            );
         }
 
         echo $CFG->phpunit_paraunit_processes . " Threads started\n";
@@ -159,8 +166,97 @@ class lib {
             }
             sleep(1);
         }
+        if ($junit) {
+            $junitfile = fopen($junit, 'w');
+            fwrite(
+                $junitfile,
+                '<?xml version="1.0" encoding="UTF-8"?>' . PHP_EOL . '<testsuites>' . PHP_EOL,
+            );
+        }
         for ($i = 0; $i < $CFG->phpunit_paraunit_processes; $i++) {
+            $junitcontents = file_get_contents("{$junit}.{$i}");
+            $testsuites = substr($junitcontents, strpos($junitcontents, '<testsuites>') + 12, -14);
+            fwrite($junitfile, $testsuites);
+            unlink("{$junit}.{$i}");
             unlink($configroot . '/phpunit.' . $i . '.xml');
         }
+        if ($junit) {
+            fwrite(
+                $junitfile,
+                '</testsuites>' . PHP_EOL,
+            );
+            fclose($junitfile);
+        }
+    }
+
+    /**
+     * Distribute test suites between threads using round-robin algorithm.
+     *
+     * This will work through the <testsuite>s in the XML structure, assigning them to each thread
+     * in turn until they are all distributed.
+     *
+     * @param \SimpleXMLElement $configxml PHPUnit config XML
+     * @return array <testsuite>s grouped by thread.
+     */
+    protected static function distribute_testsuites_round_robin(\SimpleXMLElement $configxml): array {
+        global $CFG;
+        $currentthread = 0;
+        $testsuites = array_fill(0, $CFG->phpunit_paraunit_processes, []);
+        foreach ($configxml->testsuites->testsuite as $testsuite) {
+            $testsuites[$currentthread][] = $testsuite;
+            $currentthread++;
+            if ($currentthread >= $CFG->phpunit_paraunit_processes) {
+                $currentthread = 0;
+            }
+        }
+        return $testsuites;
+    }
+
+
+    /**
+     * Distribute test suites between threads using weighting.
+     *
+     * This will use weighting (e.g. timing) for each test suite to distribute tests evenly between
+     * buckets. This should mean each thread takes about the same amount of time to run.
+     *
+     * @param \SimpleXMLElement $configxml PHPUnit config XML
+     * @param \SimpleXMLElement $junitxml Junit XML, with timing data.
+     * @return array <testsuite>s grouped by thread.
+     */
+    protected static function distribute_testsuites_weighted(\SimpleXMLElement $configxml, \SimpleXMLElement $junitxml): array {
+        global $CFG;
+        $weights = [];
+        foreach ($junitxml->testsuite->testsuite as $timedtestsuite) {
+            $weights[(string) $timedtestsuite['name']] = (float) $timedtestsuite['time'];
+        }
+        arsort($weights);
+        $unallocatedsuites = [];
+        foreach ($configxml->testsuites->testsuite as $testsuite) {
+            $unallocatedsuites[(string) $testsuite['name']] = $testsuite;
+        }
+
+        $testsuites = array_fill(0, $CFG->phpunit_paraunit_processes, []);
+        $currentweights = array_fill(0, $CFG->phpunit_paraunit_processes, 0);
+        while (count($weights) > 0) {
+            $name = array_key_first($weights);
+            $weight = $weights[$name];
+            $lightestthread = array_search(min($currentweights), $currentweights);
+            $testsuites[$lightestthread][] = $unallocatedsuites[$name];
+            $currentweights[$lightestthread] += $weight;
+            unset($weights[$name]);
+            unset($unallocatedsuites[$name]);
+        }
+
+        // Allocate any remaining suites (with no timing data) round-robin.
+        $currentthread = 0;
+        foreach ($unallocatedsuites as $testsuite) {
+            $testsuites[$currentthread][] = $testsuite;
+            $currentthread++;
+            if ($currentthread >= $CFG->phpunit_paraunit_processes) {
+                $currentthread = 0;
+            }
+        }
+
+        return $testsuites;
     }
 }
